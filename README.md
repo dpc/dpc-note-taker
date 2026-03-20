@@ -39,19 +39,16 @@ Prepend text:
 echo "header" | dpc-note-taker --session my-notes prepend
 ```
 
-### Focus on RPC
+### RPC options
 
-By default the window stays in the background when text is appended/prepended
-via RPC. To have it raise and grab focus, use:
+These flags control behavior when text is appended/prepended via RPC:
 
-```sh
-dpc-note-taker --focus
-```
-
-Or set the environment variable:
+- `--focus` — raise the window and grab focus
+- `--scroll` — scroll the editor to the inserted text
+- `--select` — select the inserted text
 
 ```sh
-export DPC_NT_FOCUS=1
+echo "hello" | dpc-note-taker --focus --scroll --select append
 ```
 
 ## How it works

@@ -23,6 +23,10 @@ struct Cli {
     #[arg(long, env = "DPC_NT_SCROLL")]
     scroll: bool,
 
+    /// Select the inserted text on RPC commands (append/prepend)
+    #[arg(long, env = "DPC_NT_SELECT")]
+    select: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -43,6 +47,8 @@ struct RpcRequest {
     focus: bool,
     #[serde(default)]
     scroll: bool,
+    #[serde(default)]
+    select: bool,
 }
 
 fn socket_path(session: &str) -> anyhow::Result<PathBuf> {
@@ -76,22 +82,15 @@ fn send_rpc(path: &Path, request: &RpcRequest) -> anyhow::Result<()> {
     }
 }
 
-fn try_connect_existing(sock: &Path, request: &RpcRequest) -> anyhow::Result<bool> {
-    match UnixStream::connect(sock) {
-        Ok(stream) => {
-            // Connection succeeded — instance is alive
-            drop(stream);
-            send_rpc(sock, request)?;
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            // Stale socket
-            let _ = std::fs::remove_file(sock);
-            Ok(false)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e.into()),
-    }
+/// Cursor/selection placement requested by an RPC command
+#[derive(Clone)]
+struct CursorRequest {
+    /// Character offset where the cursor should be placed
+    offset: usize,
+    /// If set, select from this character offset to `offset`
+    select_from: Option<usize>,
+    /// Whether to scroll the view to the cursor
+    scroll: bool,
 }
 
 fn bind_rpc_socket(sock_path: &Path) -> anyhow::Result<UnixListener> {
@@ -103,7 +102,7 @@ fn start_rpc_listener(
     listener: UnixListener,
     buffer: Arc<Mutex<String>>,
     request_focus: Arc<AtomicBool>,
-    requested_cursor: Arc<Mutex<Option<usize>>>,
+    requested_cursor: Arc<Mutex<Option<CursorRequest>>>,
 ) {
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -121,23 +120,33 @@ fn start_rpc_listener(
             };
 
             let mut buf = buffer.lock().unwrap();
-            let cursor_char_offset = match req.action.as_str() {
+            let (insert_start, insert_end) = match req.action.as_str() {
                 "append" => {
+                    let start = buf.chars().count();
                     buf.push_str(&req.content);
-                    buf.chars().count()
+                    let end = buf.chars().count();
+                    (start, end)
                 }
                 "prepend" => {
-                    let offset = req.content.chars().count();
+                    let end = req.content.chars().count();
                     *buf = format!("{}{buf}", req.content);
-                    offset
+                    (0, end)
                 }
                 _ => {
                     let _ = stream.write_all(b"unknown action");
                     continue;
                 }
             };
-            if req.scroll {
-                *requested_cursor.lock().unwrap() = Some(cursor_char_offset);
+            if req.scroll || req.select {
+                *requested_cursor.lock().unwrap() = Some(CursorRequest {
+                    offset: insert_end,
+                    select_from: if req.select {
+                        Some(insert_start)
+                    } else {
+                        None
+                    },
+                    scroll: req.scroll,
+                });
             }
             if req.focus {
                 request_focus.store(true, Ordering::Relaxed);
@@ -152,7 +161,7 @@ const EDITOR_ID: &str = "note_editor";
 struct NoteApp {
     buffer: Arc<Mutex<String>>,
     request_focus: Arc<AtomicBool>,
-    requested_cursor: Arc<Mutex<Option<usize>>>,
+    requested_cursor: Arc<Mutex<Option<CursorRequest>>>,
 }
 
 impl eframe::App for NoteApp {
@@ -164,21 +173,39 @@ impl eframe::App for NoteApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
-        let pending_cursor = self.requested_cursor.lock().unwrap().take();
-
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut buf = self.buffer.lock().unwrap();
             let editor_id = ui.make_persistent_id(EDITOR_ID);
 
-            // Set cursor position before rendering so TextEdit picks it up
-            if let Some(char_offset) = pending_cursor
+            // Set cursor/selection before rendering so TextEdit picks it up.
+            // Only consume the request once load_state succeeds (it returns
+            // None until the TextEdit has been rendered at least once).
+            let mut cursor_guard = self.requested_cursor.lock().unwrap();
+            let cursor_applied = if let Some(ref cursor_req) = *cursor_guard
                 && let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id)
             {
-                let ccursor = egui::text::CCursor::new(char_offset);
-                state
-                    .cursor
-                    .set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                let primary = egui::text::CCursor::new(cursor_req.offset);
+                let range = if let Some(from) = cursor_req.select_from {
+                    let secondary = egui::text::CCursor::new(from);
+                    egui::text::CCursorRange::two(secondary, primary)
+                } else {
+                    egui::text::CCursorRange::one(primary)
+                };
+                state.cursor.set_char_range(Some(range));
                 state.store(ctx, editor_id);
+                true
+            } else {
+                false
+            };
+            let pending_cursor = if cursor_applied {
+                cursor_guard.take()
+            } else {
+                cursor_guard.clone()
+            };
+            drop(cursor_guard);
+
+            if pending_cursor.is_some() {
+                ctx.request_repaint();
             }
 
             let min_size = ui.available_size();
@@ -192,9 +219,11 @@ impl eframe::App for NoteApp {
                         .min_size(min_size)
                         .show(ui);
 
-                    if pending_cursor.is_some() {
+                    if let Some(ref cursor_req) = pending_cursor {
                         output.response.request_focus();
-                        if let Some(cursor_range) = &output.cursor_range {
+                        if cursor_req.scroll
+                            && let Some(cursor_range) = &output.cursor_range
+                        {
                             let cursor_rect = output
                                 .galley
                                 .pos_from_cursor(&cursor_range.primary)
@@ -207,64 +236,24 @@ impl eframe::App for NoteApp {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let sock_path = socket_path(&cli.session)?;
-
-    match cli.command {
-        Some(Command::Prepend) => {
-            let content = read_stdin()?;
-            let request = RpcRequest {
-                action: "prepend".into(),
-                content,
-                focus: cli.focus,
-                scroll: cli.scroll,
-            };
-            if try_connect_existing(&sock_path, &request)? {
-                return Ok(());
-            }
-            // No instance running — start GUI with initial content
-            run_gui(&cli.session, &sock_path, request.content)?;
+/// Check if a session is already running, cleaning up stale sockets.
+/// Returns true if an instance is alive.
+fn instance_is_running(sock: &Path) -> bool {
+    match UnixStream::connect(sock) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            let _ = std::fs::remove_file(sock);
+            false
         }
-        Some(Command::Append) => {
-            let content = read_stdin()?;
-            let request = RpcRequest {
-                action: "append".into(),
-                content,
-                focus: cli.focus,
-                scroll: cli.scroll,
-            };
-            if try_connect_existing(&sock_path, &request)? {
-                return Ok(());
-            }
-            run_gui(&cli.session, &sock_path, request.content)?;
-        }
-        None => {
-            // No subcommand — just open GUI
-            if sock_path.exists() {
-                // Check if instance is alive
-                match UnixStream::connect(&sock_path) {
-                    Ok(_) => bail!(
-                        "session '{}' is already running. Use append/prepend to send text.",
-                        cli.session
-                    ),
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                        let _ = std::fs::remove_file(&sock_path);
-                    }
-                    Err(_) => {}
-                }
-            }
-            run_gui(&cli.session, &sock_path, String::new())?;
-        }
+        Err(_) => false,
     }
-
-    Ok(())
 }
 
-fn run_gui(session: &str, sock_path: &Path, initial_content: String) -> anyhow::Result<()> {
-    let buffer = Arc::new(Mutex::new(initial_content));
+/// Start a new GUI instance (forks, parent returns immediately).
+fn start_gui(session: &str, sock_path: &Path) -> anyhow::Result<()> {
+    let buffer = Arc::new(Mutex::new(String::new()));
     let request_focus = Arc::new(AtomicBool::new(false));
-    let requested_cursor = Arc::new(Mutex::new(None));
+    let requested_cursor: Arc<Mutex<Option<CursorRequest>>> = Arc::new(Mutex::new(None));
 
     // Bind the socket before forking so it's ready by the time the parent exits
     let listener = bind_rpc_socket(sock_path)?;
@@ -297,7 +286,7 @@ fn run_gui(session: &str, sock_path: &Path, initial_content: String) -> anyhow::
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         &format!("dpc-note-taker — {session}"),
         options,
         Box::new(move |_cc| {
@@ -307,8 +296,47 @@ fn run_gui(session: &str, sock_path: &Path, initial_content: String) -> anyhow::
                 requested_cursor,
             }) as Box<dyn eframe::App>)
         }),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
+    );
+
+    // This is the forked child — exit here so we don't fall back into main()
+    let code = if result.is_ok() { 0 } else { 1 };
+    std::process::exit(code);
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let sock_path = socket_path(&cli.session)?;
+
+    let request = match cli.command {
+        Some(Command::Prepend) => Some(RpcRequest {
+            action: "prepend".into(),
+            content: read_stdin()?,
+            focus: cli.focus,
+            scroll: cli.scroll,
+            select: cli.select,
+        }),
+        Some(Command::Append) => Some(RpcRequest {
+            action: "append".into(),
+            content: read_stdin()?,
+            focus: cli.focus,
+            scroll: cli.scroll,
+            select: cli.select,
+        }),
+        None => None,
+    };
+
+    if !instance_is_running(&sock_path) {
+        start_gui(&cli.session, &sock_path)?;
+    } else if request.is_none() {
+        bail!(
+            "session '{}' is already running. Use append/prepend to send text.",
+            cli.session
+        );
+    }
+
+    if let Some(request) = request {
+        send_rpc(&sock_path, &request)?;
+    }
 
     Ok(())
 }
