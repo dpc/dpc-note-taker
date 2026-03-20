@@ -12,4 +12,5 @@ serde_json.workspace = true
 directories.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+nix.workspace = true
 scopeguard.workspace = true

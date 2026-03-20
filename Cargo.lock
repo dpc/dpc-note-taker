@@ -939,6 +939,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "nix",
  "scopeguard",
  "serde",
  "serde_json",

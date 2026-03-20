@@ -35,6 +35,8 @@ enum Command {
 struct RpcRequest {
     action: String,
     content: String,
+    #[serde(default)]
+    focus: bool,
 }
 
 fn socket_path(session: &str) -> anyhow::Result<PathBuf> {
@@ -86,14 +88,16 @@ fn try_connect_existing(sock: &Path, request: &RpcRequest) -> anyhow::Result<boo
     }
 }
 
-fn start_rpc_listener(
-    sock_path: PathBuf,
-    buffer: Arc<Mutex<String>>,
-    request_focus: Option<Arc<AtomicBool>>,
-) -> anyhow::Result<()> {
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("failed to bind socket at {}", sock_path.display()))?;
+fn bind_rpc_socket(sock_path: &Path) -> anyhow::Result<UnixListener> {
+    UnixListener::bind(sock_path)
+        .with_context(|| format!("failed to bind socket at {}", sock_path.display()))
+}
 
+fn start_rpc_listener(
+    listener: UnixListener,
+    buffer: Arc<Mutex<String>>,
+    request_focus: Arc<AtomicBool>,
+) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
@@ -118,19 +122,17 @@ fn start_rpc_listener(
                     continue;
                 }
             }
-            if let Some(ref request_focus) = request_focus {
+            if req.focus {
                 request_focus.store(true, Ordering::Relaxed);
             }
             let _ = stream.write_all(b"ok");
         }
     });
-
-    Ok(())
 }
 
 struct NoteApp {
     buffer: Arc<Mutex<String>>,
-    request_focus: Option<Arc<AtomicBool>>,
+    request_focus: Arc<AtomicBool>,
 }
 
 impl eframe::App for NoteApp {
@@ -138,9 +140,7 @@ impl eframe::App for NoteApp {
         // Request repaint periodically to pick up RPC changes
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
-        if let Some(ref request_focus) = self.request_focus
-            && request_focus.swap(false, Ordering::Relaxed)
-        {
+        if self.request_focus.swap(false, Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
@@ -170,23 +170,25 @@ fn main() -> anyhow::Result<()> {
             let request = RpcRequest {
                 action: "prepend".into(),
                 content,
+                focus: cli.focus,
             };
             if try_connect_existing(&sock_path, &request)? {
                 return Ok(());
             }
             // No instance running — start GUI with initial content
-            run_gui(&cli.session, &sock_path, request.content, cli.focus)?;
+            run_gui(&cli.session, &sock_path, request.content)?;
         }
         Some(Command::Append) => {
             let content = read_stdin()?;
             let request = RpcRequest {
                 action: "append".into(),
                 content,
+                focus: cli.focus,
             };
             if try_connect_existing(&sock_path, &request)? {
                 return Ok(());
             }
-            run_gui(&cli.session, &sock_path, request.content, cli.focus)?;
+            run_gui(&cli.session, &sock_path, request.content)?;
         }
         None => {
             // No subcommand — just open GUI
@@ -203,31 +205,30 @@ fn main() -> anyhow::Result<()> {
                     Err(_) => {}
                 }
             }
-            run_gui(&cli.session, &sock_path, String::new(), cli.focus)?;
+            run_gui(&cli.session, &sock_path, String::new())?;
         }
     }
 
     Ok(())
 }
 
-fn run_gui(
-    session: &str,
-    sock_path: &Path,
-    initial_content: String,
-    focus: bool,
-) -> anyhow::Result<()> {
+fn run_gui(session: &str, sock_path: &Path, initial_content: String) -> anyhow::Result<()> {
     let buffer = Arc::new(Mutex::new(initial_content));
-    let request_focus = if focus {
-        Some(Arc::new(AtomicBool::new(false)))
-    } else {
-        None
-    };
+    let request_focus = Arc::new(AtomicBool::new(false));
 
-    start_rpc_listener(
-        sock_path.to_path_buf(),
-        Arc::clone(&buffer),
-        request_focus.clone(),
-    )?;
+    // Bind the socket before forking so it's ready by the time the parent exits
+    let listener = bind_rpc_socket(sock_path)?;
+
+    // Fork: parent exits immediately, child continues with the GUI
+    match unsafe { nix::unistd::fork() }.context("failed to fork")? {
+        nix::unistd::ForkResult::Parent { .. } => return Ok(()),
+        nix::unistd::ForkResult::Child => {
+            let _ = nix::unistd::setsid();
+        }
+    }
+
+    // Spawn the listener thread in the child process (threads don't survive fork)
+    start_rpc_listener(listener, Arc::clone(&buffer), Arc::clone(&request_focus));
 
     let sock_path = sock_path.to_path_buf();
     let _guard = scopeguard::guard((), |()| {
