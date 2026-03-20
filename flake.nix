@@ -35,6 +35,17 @@
           paths = buildPaths;
         };
 
+        runtimeLibs = [
+          pkgs.libxkbcommon
+          pkgs.wayland
+          pkgs.xorg.libX11
+          pkgs.xorg.libXcursor
+          pkgs.xorg.libXrandr
+          pkgs.xorg.libXi
+          pkgs.libGL
+          pkgs.vulkan-loader
+        ];
+
         multiBuild = (flakeboxLib.craneMultiBuild { }) (
           craneLib':
           let
@@ -42,16 +53,7 @@
               pname = projectName;
               src = buildSrc;
               nativeBuildInputs = [ pkgs.pkg-config ];
-              buildInputs = [
-                pkgs.libxkbcommon
-                pkgs.wayland
-                pkgs.xorg.libX11
-                pkgs.xorg.libXcursor
-                pkgs.xorg.libXrandr
-                pkgs.xorg.libXi
-                pkgs.libGL
-                pkgs.vulkan-loader
-              ];
+              buildInputs = runtimeLibs;
             };
           in
           rec {
@@ -74,34 +76,23 @@
             };
           }
         );
+
+        wrapped = pkgs.runCommand "${projectName}-wrapped" {
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+        } ''
+          mkdir -p $out/bin
+          makeWrapper ${multiBuild.${projectName}}/bin/${projectName} $out/bin/${projectName} \
+            --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeLibs}"
+        '';
       in
       {
-        packages.default = multiBuild.${projectName};
+        packages.default = wrapped;
         legacyPackages = multiBuild;
 
         devShells = flakeboxLib.mkShells {
-          packages = [
-            pkgs.pkg-config
-            pkgs.libxkbcommon
-            pkgs.wayland
-            pkgs.xorg.libX11
-            pkgs.xorg.libXcursor
-            pkgs.xorg.libXrandr
-            pkgs.xorg.libXi
-            pkgs.libGL
-            pkgs.vulkan-loader
-          ];
+          packages = [ pkgs.pkg-config ] ++ runtimeLibs;
           shellHook = ''
-            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [
-              pkgs.libxkbcommon
-              pkgs.wayland
-              pkgs.libGL
-              pkgs.vulkan-loader
-              pkgs.xorg.libX11
-              pkgs.xorg.libXcursor
-              pkgs.xorg.libXrandr
-              pkgs.xorg.libXi
-            ]}:$LD_LIBRARY_PATH"
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibs}:$LD_LIBRARY_PATH"
           '';
         };
       }
