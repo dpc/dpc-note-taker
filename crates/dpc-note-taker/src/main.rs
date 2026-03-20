@@ -19,6 +19,10 @@ struct Cli {
     #[arg(long, env = "DPC_NT_FOCUS")]
     focus: bool,
 
+    /// Scroll to the inserted text on RPC commands (append/prepend)
+    #[arg(long, env = "DPC_NT_SCROLL")]
+    scroll: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -37,6 +41,8 @@ struct RpcRequest {
     content: String,
     #[serde(default)]
     focus: bool,
+    #[serde(default)]
+    scroll: bool,
 }
 
 fn socket_path(session: &str) -> anyhow::Result<PathBuf> {
@@ -97,6 +103,7 @@ fn start_rpc_listener(
     listener: UnixListener,
     buffer: Arc<Mutex<String>>,
     request_focus: Arc<AtomicBool>,
+    requested_cursor: Arc<Mutex<Option<usize>>>,
 ) {
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -114,13 +121,23 @@ fn start_rpc_listener(
             };
 
             let mut buf = buffer.lock().unwrap();
-            match req.action.as_str() {
-                "append" => buf.push_str(&req.content),
-                "prepend" => *buf = format!("{}{buf}", req.content),
+            let cursor_char_offset = match req.action.as_str() {
+                "append" => {
+                    buf.push_str(&req.content);
+                    buf.chars().count()
+                }
+                "prepend" => {
+                    let offset = req.content.chars().count();
+                    *buf = format!("{}{buf}", req.content);
+                    offset
+                }
                 _ => {
                     let _ = stream.write_all(b"unknown action");
                     continue;
                 }
+            };
+            if req.scroll {
+                *requested_cursor.lock().unwrap() = Some(cursor_char_offset);
             }
             if req.focus {
                 request_focus.store(true, Ordering::Relaxed);
@@ -130,9 +147,12 @@ fn start_rpc_listener(
     });
 }
 
+const EDITOR_ID: &str = "note_editor";
+
 struct NoteApp {
     buffer: Arc<Mutex<String>>,
     request_focus: Arc<AtomicBool>,
+    requested_cursor: Arc<Mutex<Option<usize>>>,
 }
 
 impl eframe::App for NoteApp {
@@ -144,17 +164,44 @@ impl eframe::App for NoteApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
+        let pending_cursor = self.requested_cursor.lock().unwrap().take();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut buf = self.buffer.lock().unwrap();
+            let editor_id = ui.make_persistent_id(EDITOR_ID);
+
+            // Set cursor position before rendering so TextEdit picks it up
+            if let Some(char_offset) = pending_cursor
+                && let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id)
+            {
+                let ccursor = egui::text::CCursor::new(char_offset);
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                state.store(ctx, editor_id);
+            }
+
+            let min_size = ui.available_size();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add_sized(
-                        ui.available_size(),
-                        egui::TextEdit::multiline(&mut *buf)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY),
-                    );
+                    let output = egui::TextEdit::multiline(&mut *buf)
+                        .id(editor_id)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .min_size(min_size)
+                        .show(ui);
+
+                    if pending_cursor.is_some() {
+                        output.response.request_focus();
+                        if let Some(cursor_range) = &output.cursor_range {
+                            let cursor_rect = output
+                                .galley
+                                .pos_from_cursor(&cursor_range.primary)
+                                .translate(output.galley_pos.to_vec2());
+                            ui.scroll_to_rect(cursor_rect, Some(egui::Align::Center));
+                        }
+                    }
                 });
         });
     }
@@ -171,6 +218,7 @@ fn main() -> anyhow::Result<()> {
                 action: "prepend".into(),
                 content,
                 focus: cli.focus,
+                scroll: cli.scroll,
             };
             if try_connect_existing(&sock_path, &request)? {
                 return Ok(());
@@ -184,6 +232,7 @@ fn main() -> anyhow::Result<()> {
                 action: "append".into(),
                 content,
                 focus: cli.focus,
+                scroll: cli.scroll,
             };
             if try_connect_existing(&sock_path, &request)? {
                 return Ok(());
@@ -215,6 +264,7 @@ fn main() -> anyhow::Result<()> {
 fn run_gui(session: &str, sock_path: &Path, initial_content: String) -> anyhow::Result<()> {
     let buffer = Arc::new(Mutex::new(initial_content));
     let request_focus = Arc::new(AtomicBool::new(false));
+    let requested_cursor = Arc::new(Mutex::new(None));
 
     // Bind the socket before forking so it's ready by the time the parent exits
     let listener = bind_rpc_socket(sock_path)?;
@@ -228,7 +278,12 @@ fn run_gui(session: &str, sock_path: &Path, initial_content: String) -> anyhow::
     }
 
     // Spawn the listener thread in the child process (threads don't survive fork)
-    start_rpc_listener(listener, Arc::clone(&buffer), Arc::clone(&request_focus));
+    start_rpc_listener(
+        listener,
+        Arc::clone(&buffer),
+        Arc::clone(&request_focus),
+        Arc::clone(&requested_cursor),
+    );
 
     let sock_path = sock_path.to_path_buf();
     let _guard = scopeguard::guard((), |()| {
@@ -249,6 +304,7 @@ fn run_gui(session: &str, sock_path: &Path, initial_content: String) -> anyhow::
             Ok(Box::new(NoteApp {
                 buffer,
                 request_focus,
+                requested_cursor,
             }) as Box<dyn eframe::App>)
         }),
     )
