@@ -263,6 +263,19 @@ fn start_gui(session: &str, sock_path: &Path) -> anyhow::Result<()> {
         nix::unistd::ForkResult::Parent { .. } => return Ok(()),
         nix::unistd::ForkResult::Child => {
             let _ = nix::unistd::setsid();
+
+            // Redirect inherited stdio to /dev/null so callers using
+            // pipe-based output capture (e.g. Command::output()) don't
+            // block waiting for our file descriptors to close.
+            if let Ok(f) = std::fs::File::open("/dev/null") {
+                use std::os::unix::io::AsRawFd;
+                let fd = f.as_raw_fd();
+                unsafe {
+                    nix::libc::dup2(fd, 0);
+                    nix::libc::dup2(fd, 1);
+                    nix::libc::dup2(fd, 2);
+                }
+            }
         }
     }
 
