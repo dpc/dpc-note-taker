@@ -1,0 +1,15 @@
+[package]
+name = "dpc-note-taker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap.workspace = true
+eframe.workspace = true
+egui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+directories.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+scopeguard.workspace = true
